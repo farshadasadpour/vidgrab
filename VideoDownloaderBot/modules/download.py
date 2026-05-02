@@ -7,7 +7,7 @@ Download module — rewrite with:
   - One active download per user (with cancel option)
   - Auto cleanup on cancel
 """
-
+import re
 import asyncio
 import re
 import time
@@ -209,23 +209,27 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not url:
         return
 
+    # ── Block YouTube — VPS IP is flagged by YouTube ──
+    if re.search(r"(youtube\.com/watch|youtu\.be/|youtube\.com/shorts/)", url):
+        await message.reply_text(
+            "⚠️ *YouTube is not supported*\n\n"
+            "YouTube blocks downloads from server IPs.\n\n"
+            "✅ *Supported sites:*\n"
+            "Twitter/X, Instagram, TikTok, Reddit, Vimeo, "
+            "Dailymotion, Facebook, and 1000+ others.",
+            parse_mode="Markdown",
+        )
+        return
+
     user_id = update.effective_user.id
 
+    # ── Check if user already has an active download ──
     if user_id in _active:
         active_uid = _active[user_id]["uid"]
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🛑 Stop current & start new",
-                        callback_data=f"cancel:{active_uid}:new:{url}",
-                    ),
-                    InlineKeyboardButton(
-                        "⏳ Keep waiting", callback_data="cancel:ignore"
-                    ),
-                ]
-            ]
-        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🛑 Stop current & start new", callback_data=f"cancel:{active_uid}:new:{url}"),
+            InlineKeyboardButton("⏳ Keep waiting", callback_data="cancel:ignore"),
+        ]])
         await message.reply_text(
             "⚠️ You already have an active download.\n\nWhat do you want to do?",
             reply_markup=keyboard,
