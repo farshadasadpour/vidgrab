@@ -2,7 +2,6 @@
 
 A Telegram bot that downloads public videos from 1000+ sites (YouTube, Twitter/X, TikTok, Instagram, Reddit, Vimeo, etc.) and sends them back as Telegram video files.
 
-Built in the same structural pattern as [Phubdlbot](https://github.com/tzmat/Phubdlbot).
 
 ---
 
