@@ -1,15 +1,16 @@
 """
-Download module — full rewrite.
-
-Flow:
-  1. User sends a URL.
-  2. Bot downloads with yt-dlp (live progress bar).
-  3. Bot asks: Upload to Telegram or S3?
-  4. Bot uploads with live progress bar and sends result.
+Download module — rewrite with:
+  - Debounced progress updates (max 1 edit per 3s to avoid Telegram rate limit)
+  - Heartbeat animation so user knows it's still alive even when no new data
+  - Per-user S3 config (fallback to Telegram if not set)
+  - YouTube cookies support
+  - One active download per user (with cancel option)
+  - Auto cleanup on cancel
 """
 
 import asyncio
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -29,18 +30,25 @@ from telegram.ext import (
 from VideoDownloaderBot import (
     DOWNLOAD_DIR,
     LOGGER,
-    S3_BUCKET,
-    S3_ENDPOINT,
-    S3_ACCESS_KEY,
-    S3_SECRET_KEY,
+    YOUTUBE_COOKIES,
 )
 from VideoDownloaderBot.modules.status import increment_download_count
+from VideoDownloaderBot.modules.user_config import get_user_config, has_s3_config
 
 # ── URL detection ──────────────────────────────────────────────────────────
 _URL_RE = re.compile(r"https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[^\s]*)?")
 
-# Pending downloads: uid -> (file_path, title)
+# ── Active downloads per user
+_active: dict = {}
+
+# ── Pending (downloaded, waiting for upload choice)
 _pending: dict = {}
+
+# ── Telegram allows ~1 edit per second per message, we use 3s to be safe
+EDIT_INTERVAL = 3.0
+
+# ── Heartbeat symbols cycle when no new progress data arrives
+HEARTBEAT = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
 def extract_url(text: str) -> Optional[str]:
@@ -48,14 +56,11 @@ def extract_url(text: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
-# ── Progress bar ───────────────────────────────────────────────────────────
 def make_progress_bar(percent: float, width: int = 20) -> str:
     filled = int(width * percent / 100)
-    bar = "█" * filled + "░" * (width - filled)
-    return f"[{bar}] {percent:.1f}%"
+    return f"[{'█' * filled}{'░' * (width - filled)}] {percent:.1f}%"
 
 
-# ── Safe message edit ──────────────────────────────────────────────────────
 async def _edit(msg: Message, text: str, **kwargs) -> None:
     try:
         await msg.edit_text(text, **kwargs)
@@ -63,32 +68,27 @@ async def _edit(msg: Message, text: str, **kwargs) -> None:
         pass
 
 
-# ── S3 client ──────────────────────────────────────────────────────────────
-def get_s3_client():
-    return boto3.client(
-        "s3",
-        endpoint_url=S3_ENDPOINT,
-        aws_access_key_id=S3_ACCESS_KEY,
-        aws_secret_access_key=S3_SECRET_KEY,
-    )
-
-
-# ── yt-dlp download with progress ─────────────────────────────────────────
+# ── yt-dlp options ─────────────────────────────────────────────────────────
 def _build_ydl_opts(output_template: str, progress_queue: asyncio.Queue, loop) -> dict:
     def progress_hook(d):
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
             downloaded = d.get("downloaded_bytes", 0)
             speed = d.get("speed") or 0
-            if total:
-                percent = (downloaded / total) * 100
-                speed_mb = speed / (1024 * 1024)
-                asyncio.run_coroutine_threadsafe(
-                    progress_queue.put((percent, downloaded, total, speed_mb)),
-                    loop,
-                )
+            asyncio.run_coroutine_threadsafe(
+                progress_queue.put(
+                    {
+                        "percent": (downloaded / total * 100) if total else 0,
+                        "downloaded": downloaded,
+                        "total": total,
+                        "speed": speed / (1024 * 1024),
+                        "has_total": bool(total),
+                    }
+                ),
+                loop,
+            )
 
-    return {
+    opts = {
         "outtmpl": output_template,
         "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
@@ -99,37 +99,107 @@ def _build_ydl_opts(output_template: str, progress_queue: asyncio.Queue, loop) -
         "progress_hooks": [progress_hook],
     }
 
+    cookies_path = Path(YOUTUBE_COOKIES)
+    if cookies_path.exists():
+        opts["cookiefile"] = str(cookies_path)
+        LOGGER.info("Using cookies from %s", cookies_path)
 
-def _do_download(url: str, output_template: str, progress_queue: asyncio.Queue, loop) -> dict:
+    return opts
+
+
+def _do_download(
+    url: str, output_template: str, progress_queue: asyncio.Queue, loop
+) -> dict:
     opts = _build_ydl_opts(output_template, progress_queue, loop)
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=True)
 
 
-# ── Download progress updater task ────────────────────────────────────────
-async def _run_download_progress(status_msg: Message, progress_queue: asyncio.Queue):
-    last_text = ""
+# ── Progress updater with debounce + heartbeat ────────────────────────────
+async def _run_progress_display(
+    status_msg: Message,
+    progress_queue: asyncio.Queue,
+    uid: str,
+    label: str = "⬇️ Downloading",
+):
+    """
+    Reads from progress_queue and updates the message.
+    - Max 1 edit per EDIT_INTERVAL seconds (debounce)
+    - Heartbeat animation keeps updating even when queue is idle
+    - Never appears frozen to the user
+    """
+    last_edit_time = 0.0
+    last_data = None
+    heartbeat_idx = 0
+    heartbeat_tick = 0
+
+    cancel_keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel:{uid}")]]
+    )
+
     while True:
         try:
-            percent, downloaded, total, speed_mb = await asyncio.wait_for(
-                progress_queue.get(), timeout=1.0
-            )
-            text = (
-                f"⬇️ *Downloading…*\n"
-                f"{make_progress_bar(percent)}\n"
-                f"`{downloaded // (1024*1024)} MB / {total // (1024*1024)} MB`\n"
-                f"🚀 Speed: `{speed_mb:.1f} MB/s`"
-            )
-            if text != last_text:
-                last_text = text
-                await _edit(status_msg, text, parse_mode="Markdown")
-        except asyncio.TimeoutError:
-            continue
+            # Try to get latest progress, drain the queue to get most recent
+            data = None
+            try:
+                while True:
+                    data = progress_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+
+            if data:
+                last_data = data
+
+            now = time.time()
+            heartbeat_tick += 1
+
+            # Build message text
+            if last_data and last_data["has_total"]:
+                spin = HEARTBEAT[heartbeat_idx % len(HEARTBEAT)]
+                text = (
+                    f"{label}… {spin}\n"
+                    f"{make_progress_bar(last_data['percent'])}\n"
+                    f"`{last_data['downloaded'] // (1024*1024)} MB"
+                    f" / {last_data['total'] // (1024*1024)} MB`\n"
+                    f"🚀 `{last_data['speed']:.1f} MB/s`"
+                )
+            elif last_data:
+                # No total size available
+                spin = HEARTBEAT[heartbeat_idx % len(HEARTBEAT)]
+                downloaded_mb = last_data["downloaded"] // (1024 * 1024)
+                text = (
+                    f"{label}… {spin}\n"
+                    f"`{downloaded_mb} MB downloaded`\n"
+                    f"🚀 `{last_data['speed']:.1f} MB/s`"
+                )
+            else:
+                # No data yet — show animated waiting
+                spin = HEARTBEAT[heartbeat_idx % len(HEARTBEAT)]
+                text = f"{label}… {spin}\n`Waiting for data…`"
+
+            # Advance heartbeat every tick
+            heartbeat_idx += 1
+
+            # Only edit if enough time has passed (debounce)
+            if now - last_edit_time >= EDIT_INTERVAL:
+                await _edit(
+                    status_msg,
+                    text,
+                    parse_mode="Markdown",
+                    reply_markup=cancel_keyboard,
+                )
+                last_edit_time = now
+
+            await asyncio.sleep(1.0)
+
         except asyncio.CancelledError:
             break
+        except Exception as exc:
+            LOGGER.warning("Progress display error: %s", exc)
+            await asyncio.sleep(1.0)
 
 
-# ── Step 1: Download and ask user ─────────────────────────────────────────
+# ── Main download handler ──────────────────────────────────────────────────
 async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message or not message.text:
@@ -139,15 +209,43 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not url:
         return
 
+    user_id = update.effective_user.id
+
+    if user_id in _active:
+        active_uid = _active[user_id]["uid"]
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🛑 Stop current & start new",
+                        callback_data=f"cancel:{active_uid}:new:{url}",
+                    ),
+                    InlineKeyboardButton(
+                        "⏳ Keep waiting", callback_data="cancel:ignore"
+                    ),
+                ]
+            ]
+        )
+        await message.reply_text(
+            "⚠️ You already have an active download.\n\nWhat do you want to do?",
+            reply_markup=keyboard,
+        )
+        return
+
+    await _start_download(message, user_id, url)
+
+
+async def _start_download(message: Message, user_id: int, url: str) -> None:
     status_msg = await message.reply_text("⏳ Fetching video info…")
     uid = uuid.uuid4().hex[:8]
     output_template = str(DOWNLOAD_DIR / f"{uid}.%(ext)s")
-
     progress_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
 
+    _active[user_id] = {"uid": uid, "status_msg": status_msg}
+
     progress_task = asyncio.create_task(
-        _run_download_progress(status_msg, progress_queue)
+        _run_progress_display(status_msg, progress_queue, uid, "⬇️ Downloading")
     )
 
     try:
@@ -156,16 +254,25 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     except yt_dlp.DownloadError as exc:
         progress_task.cancel()
-        LOGGER.warning("yt-dlp error: %s", exc)
         await _edit(status_msg, f"❌ Download failed.\n\n`{exc}`")
+        for f in DOWNLOAD_DIR.glob(f"{uid}.*"):
+            f.unlink(missing_ok=True)
+        return
+    except asyncio.CancelledError:
+        await _edit(status_msg, "🛑 Download cancelled.")
+        for f in DOWNLOAD_DIR.glob(f"{uid}.*"):
+            f.unlink(missing_ok=True)
         return
     except Exception as exc:
         progress_task.cancel()
         LOGGER.exception("Unexpected download error")
         await _edit(status_msg, f"❌ Unexpected error.\n\n`{exc}`")
+        for f in DOWNLOAD_DIR.glob(f"{uid}.*"):
+            f.unlink(missing_ok=True)
         return
     finally:
         progress_task.cancel()
+        _active.pop(user_id, None)
 
     files = list(DOWNLOAD_DIR.glob(f"{uid}.*"))
     if not files:
@@ -175,34 +282,89 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     file_path = files[0]
     title = (info.get("title") or "Video") if info else "Video"
     size_mb = file_path.stat().st_size / (1024 * 1024)
-
-    # Store for callback
     _pending[uid] = (file_path, title)
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📱 Send to Telegram", callback_data=f"tg:{uid}"),
-            InlineKeyboardButton("☁️ Upload to S3", callback_data=f"s3:{uid}"),
-        ]
-    ])
+    if has_s3_config(user_id):
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("📱 Telegram", callback_data=f"tg:{uid}"),
+                    InlineKeyboardButton("☁️ My S3", callback_data=f"s3:{uid}"),
+                ]
+            ]
+        )
+        destination_text = "Where do you want to upload?"
+    else:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📱 Send to Telegram", callback_data=f"tg:{uid}"
+                    ),
+                    InlineKeyboardButton("⚙️ Setup S3", callback_data=f"setup_s3:{uid}"),
+                ]
+            ]
+        )
+        destination_text = "No S3 configured — send to Telegram or setup S3 first."
 
     await _edit(
         status_msg,
         f"✅ *Downloaded!*\n\n"
         f"🎬 {title}\n"
         f"📦 Size: `{size_mb:.1f} MB`\n\n"
-        f"Where do you want to upload?",
+        f"{destination_text}",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
 
 
-# ── Step 2: Handle button choice ──────────────────────────────────────────
+# ── Cancel handler ─────────────────────────────────────────────────────────
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":", 3)
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "ignore":
+        await query.answer("⏳ Waiting for current download…", show_alert=False)
+        return
+
+    uid = parts[1]
+    user_id = update.effective_user.id
+
+    _active.pop(user_id, None)
+
+    for f in DOWNLOAD_DIR.glob(f"{uid}.*"):
+        f.unlink(missing_ok=True)
+    _pending.pop(uid, None)
+
+    if len(parts) == 4 and parts[2] == "new":
+        new_url = parts[3]
+        await query.edit_message_text("🛑 Cancelled. Starting new download…")
+        await _start_download(query.message, user_id, new_url)
+    else:
+        await query.edit_message_text("🛑 Cancelled and files removed.")
+
+
+# ── Upload choice handler ──────────────────────────────────────────────────
 async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
-    destination, uid = query.data.split(":", 1)
+    data = query.data
+    user_id = update.effective_user.id
+
+    if data.startswith("setup_s3:"):
+        await query.edit_message_text(
+            "⚙️ *Setup your S3 bucket:*\n\n"
+            "`/setconfig <endpoint> <access_key> <secret_key> <bucket>`\n\n"
+            "Then resend the URL.",
+            parse_mode="Markdown",
+        )
+        return
+
+    destination, uid = data.split(":", 1)
 
     if uid not in _pending:
         await query.edit_message_text("❌ Session expired. Send the URL again.")
@@ -212,8 +374,15 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if destination == "tg":
         await _upload_telegram(query.message, file_path, title)
-    else:
-        await _upload_s3(query.message, file_path, title, uid)
+    elif destination == "s3":
+        cfg = get_user_config(user_id)
+        if not cfg:
+            await query.edit_message_text(
+                "❌ No S3 config found. Use /setconfig first."
+            )
+            file_path.unlink(missing_ok=True)
+            return
+        await _upload_s3(query.message, file_path, title, uid, cfg)
 
 
 # ── Upload to Telegram ─────────────────────────────────────────────────────
@@ -225,10 +394,11 @@ async def _upload_telegram(message: Message, file_path: Path, title: str) -> Non
                 video=f,
                 caption=f"🎬 {title}",
                 supports_streaming=True,
+                read_timeout=300,
+                write_timeout=300,
             )
         await message.delete()
         increment_download_count()
-        LOGGER.info("Sent '%s' to Telegram", title)
     except Exception as exc:
         LOGGER.exception("Telegram upload error")
         await _edit(message, f"❌ Telegram upload failed.\n\n`{exc}`")
@@ -237,21 +407,29 @@ async def _upload_telegram(message: Message, file_path: Path, title: str) -> Non
 
 
 # ── Upload to S3 with progress ─────────────────────────────────────────────
-async def _upload_s3(message: Message, file_path: Path, title: str, uid: str) -> None:
+async def _upload_s3(
+    message: Message, file_path: Path, title: str, uid: str, cfg: dict
+) -> None:
     try:
-        s3 = get_s3_client()
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=cfg["s3_endpoint"],
+            aws_access_key_id=cfg["s3_access_key"],
+            aws_secret_access_key=cfg["s3_secret_key"],
+        )
+        bucket = cfg["s3_bucket"]
         file_size = file_path.stat().st_size
         loop = asyncio.get_event_loop()
         uploaded = 0
-        last_percent = -1.0
+        last_edit_time = 0.0
 
         def progress_callback(bytes_transferred):
-            nonlocal uploaded, last_percent
+            nonlocal uploaded, last_edit_time
             uploaded += bytes_transferred
             percent = (uploaded / file_size) * 100
-            if percent - last_percent >= 2:
-                last_percent = percent
-                speed = 0  # boto3 doesn't give speed natively
+            now = time.time()
+            if now - last_edit_time >= EDIT_INTERVAL:
+                last_edit_time = now
                 text = (
                     f"☁️ *Uploading to S3…*\n"
                     f"{make_progress_bar(percent)}\n"
@@ -263,19 +441,18 @@ async def _upload_s3(message: Message, file_path: Path, title: str, uid: str) ->
                 )
 
         s3_key = f"videos/{uid}/{file_path.name}"
-
         await loop.run_in_executor(
             None,
             lambda: s3.upload_file(
                 str(file_path),
-                S3_BUCKET,
+                bucket,
                 s3_key,
                 Callback=progress_callback,
                 ExtraArgs={"ACL": "public-read"},
             ),
         )
 
-        public_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{s3_key}"
+        public_url = f"{cfg['s3_endpoint']}/{bucket}/{s3_key}"
         size_mb = file_size / (1024 * 1024)
 
         await message.reply_text(
@@ -286,7 +463,6 @@ async def _upload_s3(message: Message, file_path: Path, title: str, uid: str) ->
         )
         await message.delete()
         increment_download_count()
-        LOGGER.info("Uploaded '%s' to S3: %s", title, public_url)
 
     except ClientError as exc:
         LOGGER.error("S3 error: %s", exc)
@@ -306,4 +482,5 @@ def register(app: Application) -> None:
             download_handler,
         )
     )
-    app.add_handler(CallbackQueryHandler(choice_handler, pattern=r"^(tg|s3):"))
+    app.add_handler(CallbackQueryHandler(choice_handler, pattern=r"^(tg|s3|setup_s3):"))
+    app.add_handler(CallbackQueryHandler(cancel_handler, pattern=r"^cancel:"))

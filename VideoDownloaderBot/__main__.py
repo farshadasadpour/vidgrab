@@ -1,19 +1,21 @@
+"""
+Entry point: python3 -m VideoDownloaderBot
+"""
+
 from telegram.ext import Application
+
 from VideoDownloaderBot import BOT_TOKEN, LOGGER
-from VideoDownloaderBot.modules import download, help_cmd, start, status, cleanup
+from VideoDownloaderBot.modules import cleanup, download, help_cmd, start, status, user_config
 
 
 def build_application() -> Application:
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
     start.register(app)
     help_cmd.register(app)
     download.register(app)
     status.register(app)
     cleanup.register(app)
+    user_config.register(app)
     return app
 
 
