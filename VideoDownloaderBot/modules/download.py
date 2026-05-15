@@ -2,6 +2,7 @@
 Download module — full rewrite with:
   - Per-user S3 config (fallback to Telegram if not set)
   - YouTube blocked with friendly message
+  - Friendly error messages for common HTTP errors
   - Download progress bar with heartbeat animation
   - One active download per user with cancel option
   - History saved after every successful upload
@@ -64,6 +65,28 @@ async def _edit(msg: Message, text: str, **kwargs) -> None:
         await msg.edit_text(text, **kwargs)
     except Exception:
         pass
+
+
+def _friendly_error(exc: Exception) -> str:
+    err = str(exc)
+    if "HTTP Error 410" in err or "Gone" in err:
+        return "❌ This video is no longer available.\n\nIt may have been deleted or expired on the source site."
+    elif "HTTP Error 403" in err or "Forbidden" in err:
+        return "❌ Access denied.\n\nThis video is private or region-restricted."
+    elif "HTTP Error 404" in err or "Not Found" in err:
+        return "❌ Video not found.\n\nThe URL may be wrong or the content was removed."
+    elif "HTTP Error 429" in err or "Too Many Requests" in err:
+        return "❌ Rate limited by the source site.\n\nPlease wait a few minutes and try again."
+    elif "HTTP Error 401" in err or "Unauthorized" in err:
+        return "❌ This video requires login to download."
+    elif "HTTP Error 500" in err or "HTTP Error 503" in err:
+        return "❌ The source site is having issues.\n\nPlease try again later."
+    elif "Unsupported URL" in err:
+        return "❌ This URL is not supported.\n\nMake sure it's a direct video link."
+    elif "Sign in" in err or "bot" in err.lower():
+        return "❌ The source site is blocking server downloads.\n\nTry a different site."
+    else:
+        return f"❌ Download failed.\n\n`{exc}`"
 
 
 # ── yt-dlp ─────────────────────────────────────────────────────────────────
@@ -228,16 +251,19 @@ async def _start_download(message: Message, user_id: int, url: str) -> None:
             None, _do_download, url, output_template, progress_queue, loop
         )
     except yt_dlp.DownloadError as exc:
-        await _edit(status_msg, f"❌ Download failed.\n\n`{exc}`")
+        progress_task.cancel()
+        await _edit(status_msg, _friendly_error(exc), parse_mode="Markdown")
         for f in DOWNLOAD_DIR.glob(f"{uid}.*"):
             f.unlink(missing_ok=True)
         return
     except asyncio.CancelledError:
+        progress_task.cancel()
         await _edit(status_msg, "🛑 Download cancelled.")
         for f in DOWNLOAD_DIR.glob(f"{uid}.*"):
             f.unlink(missing_ok=True)
         return
     except Exception as exc:
+        progress_task.cancel()
         LOGGER.exception("Unexpected download error")
         await _edit(status_msg, f"❌ Unexpected error.\n\n`{exc}`")
         for f in DOWNLOAD_DIR.glob(f"{uid}.*"):
