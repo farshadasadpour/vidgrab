@@ -29,6 +29,7 @@ With S3, upload files of any size.
 /myconfig — View or update your S3 config
 /status — Bot uptime and stats
 /cancel — Cancel current S3 setup
+/history — View your download history & manage S3 files
 
 ━━━━━━━━━━━━━━━━━━━━
 ✅ *Supported Sites*
