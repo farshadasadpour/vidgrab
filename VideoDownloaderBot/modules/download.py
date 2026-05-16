@@ -35,13 +35,15 @@ from VideoDownloaderBot import (
 from VideoDownloaderBot.modules.history import add_to_history
 from VideoDownloaderBot.modules.status import increment_download_count
 from VideoDownloaderBot.modules.user_config import get_user_config, has_s3_config
+from VideoDownloaderBot import GEO_BYPASS_COUNTRY
+
 
 # ── URL detection ──────────────────────────────────────────────────────────
 _URL_RE = re.compile(r"https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[^\s]*)?")
 _YOUTUBE_RE = re.compile(r"(youtube\.com/watch|youtu\.be/|youtube\.com/shorts/)")
 
 # ── State ──────────────────────────────────────────────────────────────────
-_active: dict = {}   # user_id -> {"uid": ..., "status_msg": ...}
+_active: dict = {}  # user_id -> {"uid": ..., "status_msg": ...}
 _pending: dict = {}  # uid -> (file_path, title, url)
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -84,7 +86,9 @@ def _friendly_error(exc: Exception) -> str:
     elif "Unsupported URL" in err:
         return "❌ This URL is not supported.\n\nMake sure it's a direct video link."
     elif "Sign in" in err or "bot" in err.lower():
-        return "❌ The source site is blocking server downloads.\n\nTry a different site."
+        return (
+            "❌ The source site is blocking server downloads.\n\nTry a different site."
+        )
     else:
         return f"❌ Download failed.\n\n`{exc}`"
 
@@ -99,13 +103,15 @@ def _build_ydl_opts(output_template: str, progress_queue: asyncio.Queue, loop) -
             downloaded = d.get("downloaded_bytes", 0)
             speed = d.get("speed") or 0
             asyncio.run_coroutine_threadsafe(
-                progress_queue.put({
-                    "percent": (downloaded / total * 100) if total else 0,
-                    "downloaded": downloaded,
-                    "total": total,
-                    "speed": speed / (1024 * 1024),
-                    "has_total": bool(total),
-                }),
+                progress_queue.put(
+                    {
+                        "percent": (downloaded / total * 100) if total else 0,
+                        "downloaded": downloaded,
+                        "total": total,
+                        "speed": speed / (1024 * 1024),
+                        "has_total": bool(total),
+                    }
+                ),
                 loop,
             )
 
@@ -118,6 +124,8 @@ def _build_ydl_opts(output_template: str, progress_queue: asyncio.Queue, loop) -
         "no_warnings": True,
         "socket_timeout": 30,
         "progress_hooks": [progress_hook],
+        "geo_bypass": True,  # ← bypass geo-restriction
+        "geo_bypass_country": GEO_BYPASS_COUNTRY,  # ← spoof as US
     }
 
     # Use a single merged cookies file if it exists
@@ -134,7 +142,9 @@ def _build_ydl_opts(output_template: str, progress_queue: asyncio.Queue, loop) -
     return opts
 
 
-def _do_download(url: str, output_template: str, progress_queue: asyncio.Queue, loop) -> dict:
+def _do_download(
+    url: str, output_template: str, progress_queue: asyncio.Queue, loop
+) -> dict:
     opts = _build_ydl_opts(output_template, progress_queue, loop)
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=True)
@@ -151,9 +161,9 @@ async def _run_progress_display(
     last_data = None
     heartbeat_idx = 0
 
-    cancel_keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel:{uid}")
-    ]])
+    cancel_keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🛑 Cancel", callback_data=f"cancel:{uid}")]]
+    )
 
     while True:
         try:
@@ -229,10 +239,19 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # One download at a time
     if user_id in _active:
         active_uid = _active[user_id]["uid"]
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🛑 Stop & start new", callback_data=f"cancel:{active_uid}:new:{url}"),
-            InlineKeyboardButton("⏳ Keep waiting", callback_data="cancel:ignore"),
-        ]])
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🛑 Stop & start new",
+                        callback_data=f"cancel:{active_uid}:new:{url}",
+                    ),
+                    InlineKeyboardButton(
+                        "⏳ Keep waiting", callback_data="cancel:ignore"
+                    ),
+                ]
+            ]
+        )
         await message.reply_text(
             "⚠️ You already have an active download.\nWhat do you want to do?",
             reply_markup=keyboard,
@@ -294,16 +313,26 @@ async def _start_download(message: Message, user_id: int, url: str) -> None:
     _pending[uid] = (file_path, title, url)
 
     if has_s3_config(user_id):
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📱 Telegram", callback_data=f"tg:{uid}"),
-            InlineKeyboardButton("☁️ My S3", callback_data=f"s3:{uid}"),
-        ]])
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("📱 Telegram", callback_data=f"tg:{uid}"),
+                    InlineKeyboardButton("☁️ My S3", callback_data=f"s3:{uid}"),
+                ]
+            ]
+        )
         destination_text = "Where do you want to upload?"
     else:
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📱 Send to Telegram", callback_data=f"tg:{uid}"),
-            InlineKeyboardButton("⚙️ Setup S3", callback_data=f"setup_s3:{uid}"),
-        ]])
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📱 Send to Telegram", callback_data=f"tg:{uid}"
+                    ),
+                    InlineKeyboardButton("⚙️ Setup S3", callback_data=f"setup_s3:{uid}"),
+                ]
+            ]
+        )
         destination_text = "No S3 configured — send to Telegram or use /setup first."
 
     await _edit(
@@ -400,14 +429,17 @@ async def _upload_telegram(
                 write_timeout=300,
             )
 
-        add_to_history(user_id, {
-            "uid": uid,
-            "title": title,
-            "url": url,
-            "destination": "telegram",
-            "size_mb": round(size_mb, 2),
-            "timestamp": time.time(),
-        })
+        add_to_history(
+            user_id,
+            {
+                "uid": uid,
+                "title": title,
+                "url": url,
+                "destination": "telegram",
+                "size_mb": round(size_mb, 2),
+                "timestamp": time.time(),
+            },
+        )
 
         await message.delete()
         increment_download_count()
@@ -476,18 +508,21 @@ async def _upload_s3(
         public_url = f"{cfg['s3_endpoint']}/{bucket}/{s3_key}"
         size_mb = file_size / (1024 * 1024)
 
-        add_to_history(user_id, {
-            "uid": uid,
-            "title": title,
-            "url": url,
-            "destination": "s3",
-            "s3_key": s3_key,
-            "s3_bucket": bucket,
-            "s3_endpoint": cfg["s3_endpoint"],
-            "public_url": public_url,
-            "size_mb": round(size_mb, 2),
-            "timestamp": time.time(),
-        })
+        add_to_history(
+            user_id,
+            {
+                "uid": uid,
+                "title": title,
+                "url": url,
+                "destination": "s3",
+                "s3_key": s3_key,
+                "s3_bucket": bucket,
+                "s3_endpoint": cfg["s3_endpoint"],
+                "public_url": public_url,
+                "size_mb": round(size_mb, 2),
+                "timestamp": time.time(),
+            },
+        )
 
         await message.reply_text(
             f"✅ *{title}*\n\n"
