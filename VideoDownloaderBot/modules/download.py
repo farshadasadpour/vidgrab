@@ -91,6 +91,8 @@ def _friendly_error(exc: Exception) -> str:
 
 # ── yt-dlp ─────────────────────────────────────────────────────────────────
 def _build_ydl_opts(output_template: str, progress_queue: asyncio.Queue, loop) -> dict:
+    from VideoDownloaderBot import YOUTUBE_COOKIES, INSTAGRAM_COOKIES
+
     def progress_hook(d):
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
@@ -118,9 +120,16 @@ def _build_ydl_opts(output_template: str, progress_queue: asyncio.Queue, loop) -
         "progress_hooks": [progress_hook],
     }
 
-    cookies_path = Path(YOUTUBE_COOKIES)
-    if cookies_path.exists():
-        opts["cookiefile"] = str(cookies_path)
+    # Use a single merged cookies file if it exists
+    # Otherwise fall back to site-specific ones
+    merged = Path("cookies.txt")
+    if merged.exists():
+        opts["cookiefile"] = str(merged)
+    else:
+        # Try Instagram cookies
+        ig_cookies = Path(INSTAGRAM_COOKIES)
+        if ig_cookies.exists():
+            opts["cookiefile"] = str(ig_cookies)
 
     return opts
 

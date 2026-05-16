@@ -36,5 +36,5 @@ USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 # YouTube cookies file path (optional)
 YOUTUBE_COOKIES: str = os.environ.get("YOUTUBE_COOKIES", "cookies.txt")
-
+INSTAGRAM_COOKIES: str = os.environ.get("INSTAGRAM_COOKIES", "instagram_cookies.txt")
 LOGGER.info("Config loaded — owner=%s, max_size=%sMB", OWNER_ID, MAX_FILE_SIZE_MB)
